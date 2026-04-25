@@ -1057,12 +1057,20 @@ class TestFindDirectoriesWithRawFiles(TestCase):
             d2.mkdir(parents=True)
             (d1 / "root.dng").touch()
             (d2 / "lupine.dng").touch()
+            (d2 / "rose.cr3").touch()
 
             result = list_directories_with_raw_files(Path(tmpdir))
 
         self.assertEqual(result["root"], tmpdir)
         self.assertEqual(result["directories_scanned"], 2)
         self.assertEqual(result["directories"], [str(d1), str(d2)])
+        # Each directory's raw files are captured during the same walk so
+        # callers don't have to re-enumerate.
+        self.assertEqual(result["directory_files"][str(d1)], [str(d1 / "root.dng")])
+        self.assertEqual(
+            result["directory_files"][str(d2)],
+            [str(d2 / "lupine.dng"), str(d2 / "rose.cr3")],
+        )
 
 
 class TestResultFileDetection(TestCase):
@@ -1071,6 +1079,46 @@ class TestResultFileDetection(TestCase):
 
     def test_known_external_result_filename(self):
         self.assertTrue(is_known_result_filename(Path("_ON_4708 (6 files).dng")))
+
+    def test_known_helicon_legacy_result_filename(self):
+        # Helicon Focus 6.x default save format: <first>-<count>(method,Rradius,Ssmoothing).dng
+        self.assertTrue(is_known_result_filename(Path("_ON_1349-6(B,R8,S4).dng")))
+
+    def test_lightroom_edit_copy_of_result_is_recognized(self):
+        # LR's "Edit a Copy in Photoshop" appends -Edit.<ext>. Edits of any of
+        # the three result formats should still be recognized as results.
+        self.assertTrue(is_known_result_filename(Path("_ON_1349-6(B,R8,S4)-Edit.tif")))
+        self.assertTrue(is_known_result_filename(Path("_ON_4708 (6 files)-Edit.tif")))
+        self.assertTrue(is_known_result_filename(Path("-_ON_1000-_ON_1009_10f_mB_s5_r11_stacked-Edit.tif")))
+
+    def test_helicon_legacy_result_is_parsed_with_first_stem(self):
+        from detect_stacks import parse_result_file_info
+        info = parse_result_file_info(Path("_ON_1349-6(B,R8,S4).dng"))
+        self.assertEqual(info["kind"], "external")
+        self.assertEqual(info["first_stem"], "_ON_1349")
+        self.assertIsNone(info["last_stem"])
+        self.assertEqual(info["count"], 6)
+        self.assertEqual(info["method"], "B")
+        self.assertEqual(info["radius"], 8)
+        self.assertEqual(info["smoothing"], 4)
+
+    def test_helicon_legacy_result_attaches_to_stack_by_first_stem_and_count(self):
+        from detect_stacks import parse_result_file_info, attach_result_files_to_stacks
+        stack = FocusStack(
+            name="_ON_1349-_ON_1354",
+            count=6,
+            files=[f"/tmp/_ON_{n}.cr3" for n in range(1349, 1355)],
+            focal_length=None,
+            iso=None,
+            aperture=None,
+            shutter_speed=None,
+            time_span_seconds=0.0,
+            first_image_time=None,
+            last_exposure_time_seconds=None,
+        )
+        result_info = parse_result_file_info(Path("/tmp/_ON_1349-6(B,R8,S4).dng"))
+        attached = attach_result_files_to_stacks([stack], [result_info])
+        self.assertEqual(len(attached[0]["result_files"]), 1)
 
     def test_rendered_linear_raw_dng_is_result(self):
         entry = {

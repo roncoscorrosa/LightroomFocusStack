@@ -14,33 +14,11 @@ local FsmExifToolMeta = require 'FsmExifToolMeta'
 local Timing = require 'Timing'
 local logger = require 'Log'
 
-local RAW_EXTENSIONS = {
-    cr2 = true, cr3 = true, nef = true, arw = true, dng = true,
-    raf = true, orf = true, rw2 = true, raw = true,
-}
-
-local function fileExtension(name)
-    local ext = name:match("%.([^.]+)$")
-    return ext and ext:lower() or nil
-end
-
-local function enumerateRawFiles(dirPath)
-    local files = {}
-    if not dirPath or not LrFileUtils.exists(dirPath) then
-        return files
-    end
-    for entry in LrFileUtils.directoryEntries(dirPath) do
-        if LrFileUtils.exists(entry) == "file" then
-            local ext = fileExtension(entry)
-            if ext and RAW_EXTENSIONS[ext] then
-                table.insert(files, entry)
-            end
-        end
-    end
-    table.sort(files)
-    return files
-end
-
+-- Provider closure returns (metadata, photosByPath). The second return lets
+-- the catalog provider hand its already-resolved LrPhoto refs back to the
+-- caller; the prep loop reuses them instead of paying for a second
+-- findPhotoByPath round-trip per file. The exiftool provider returns an
+-- empty photo map; callers fall back to catalog:findPhotoByPath in that case.
 local function buildProvider(prefs, catalog)
     local kind = prefs.metadata_provider or "lr_catalog"
     if kind == "exiftool" then
@@ -150,7 +128,7 @@ local function withCatalogWriteRetry(catalog, actionName, fn, opts)
     end
 end
 
-local function createCollectionsForDirectory(catalog, directoryResult, rootSet, timing)
+local function createCollectionsForDirectory(catalog, directoryResult, rootSet, timing, photosByPath)
     local prefs = LrPrefs.prefsForPlugin()
     local sourceDir = directoryResult.directory
     local stacks = directoryResult.stacks or {}
@@ -183,7 +161,13 @@ local function createCollectionsForDirectory(catalog, directoryResult, rootSet, 
         local missingCount = 0
         local lookupStart = LrDate.currentTime()
         for _, filePath in ipairs(stack.files) do
-            local photo = catalog:findPhotoByPath(filePath, false)
+            -- Reuse the LrPhoto resolved by the catalog provider when possible.
+            -- Falls back to catalog:findPhotoByPath when photosByPath is empty
+            -- (exiftool provider) or the path was not resolved earlier.
+            local photo = photosByPath and photosByPath[filePath]
+            if not photo then
+                photo = catalog:findPhotoByPath(filePath, false)
+            end
             if photo then
                 table.insert(photosToAdd, photo)
             else
@@ -498,6 +482,7 @@ function DetectionService.run(scanRoot, queuePosition, queueTotal, opts)
     end
 
     state.directories = listing.directories or {}
+    state.directoryFiles = listing.directory_files or {}
     state.totalDirectories = #state.directories
 
     if state.totalDirectories == 0 then
@@ -537,18 +522,23 @@ function DetectionService.run(scanRoot, queuePosition, queueTotal, opts)
         -- file, and pass that path to the Python script. If gathering fails
         -- (catalog miss, exiftool error), fall through with no metadata path
         -- and Python's built-in exiftool path takes over for that directory.
-        local providerStart = LrDate.currentTime()
-        local rawFiles = enumerateRawFiles(directoryPath)
-        timing:add("enumerate_raw_files", LrDate.currentTime() - providerStart)
-
-        -- Don't wrap this in pcall: catalog:findPhotoByPath yields internally,
-        -- and Lua 5.1's pcall can't span a yield ("Yielding is not allowed
-        -- within a C or metamethod call"). If the provider blows up we want
-        -- the real stack trace anyway.
+        --
+        -- Don't wrap the provider call in pcall: catalog:findPhotoByPath
+        -- yields internally, and Lua 5.1's pcall can't span a yield. If the
+        -- provider blows up we want the real stack trace anyway.
+        --
+        -- File enumeration: we use the file list captured by Python's
+        -- --list-directories pass instead of re-walking each directory via
+        -- LrFileUtils. On a slow network volume the Lua-side per-dir walk
+        -- was a substantial cost (in one ~250-dir scan it was ~13 minutes
+        -- for what Python had already done in 66 s).
+        local rawFiles = state.directoryFiles[directoryPath] or {}
         local metadataPath = nil
-        if rawFiles and #rawFiles > 0 then
+        local photosByPath = nil
+        if #rawFiles > 0 then
             local providerCallStart = LrDate.currentTime()
-            local metadata = provider(rawFiles)
+            local metadata
+            metadata, photosByPath = provider(rawFiles)
             timing:add("provider_getMetadata", LrDate.currentTime() - providerCallStart)
             if metadata then
                 local writeStart = LrDate.currentTime()
@@ -618,7 +608,7 @@ function DetectionService.run(scanRoot, queuePosition, queueTotal, opts)
 
         local createStart = LrDate.currentTime()
         local newCount, existingCount, adoptedResults, skippedEmpty, skippedIncomplete =
-            createCollectionsForDirectory(state.catalog, dirResult, rootSet, timing)
+            createCollectionsForDirectory(state.catalog, dirResult, rootSet, timing, photosByPath)
         timing:add("create_collections_total", LrDate.currentTime() - createStart)
 
         state.totalRaw = state.totalRaw + (dirResult.total_raw_files or 0)

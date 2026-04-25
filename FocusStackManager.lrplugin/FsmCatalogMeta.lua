@@ -77,18 +77,25 @@ local function buildEntry(photo, filePath)
     return entry
 end
 
+-- Returns metadata, photosByPath.
+--
+-- photosByPath caches the LrPhoto object for each file we looked up so the
+-- caller can reuse it during the prep phase (catalog write transactions)
+-- instead of paying for a second findPhotoByPath round-trip per file.
 function FsmCatalogMeta.getMetadataForFiles(catalog, filePaths)
-    local result = {}
+    local metadata = {}
+    local photosByPath = {}
     if not catalog or not filePaths then
-        return result
+        return metadata, photosByPath
     end
     for _, filePath in ipairs(filePaths) do
         local photo = catalog:findPhotoByPath(filePath, false)
         if photo then
-            result[filePath] = buildEntry(photo, filePath)
+            photosByPath[filePath] = photo
+            metadata[filePath] = buildEntry(photo, filePath)
         end
     end
-    return result
+    return metadata, photosByPath
 end
 
 return FsmCatalogMeta

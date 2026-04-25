@@ -113,15 +113,27 @@ COMMON_EXIFTOOL_PATHS = (
 # real-world false positives show up.
 ENABLE_HEURISTIC_RESULT_CORRELATION = True
 RESULT_FILENAME_PATTERNS = (
-    re.compile(r"_stacked\.[^.]+$", re.IGNORECASE),
-    re.compile(r"\(\d+\s+files\)\.[^.]+$", re.IGNORECASE),
+    # Plugin-generated: <name>_stacked.<ext>
+    re.compile(r"_stacked(?:-Edit)?\.[^.]+$", re.IGNORECASE),
+    # Modern Helicon Focus output: <name> (N files).<ext>
+    re.compile(r"\(\d+\s+files\)(?:-Edit)?\.[^.]+$", re.IGNORECASE),
+    # Legacy Helicon Focus output: <name>-N(method,Rradius,Ssmoothing).<ext>
+    # (e.g. _ON_1349-6(B,R8,S4).dng — Helicon 6.x default naming)
+    re.compile(r"-\d+\([A-Z],R\d+,S\d+\)(?:-Edit)?\.[^.]+$", re.IGNORECASE),
 )
+# All three parse patterns also accept a trailing "-Edit" so Lightroom's
+# "Edit a Copy" / "Edit in Photoshop" derivatives still correlate back to
+# the originating focus stack.
 PLUGIN_RESULT_PATTERN = re.compile(
-    r"^-(?P<first>.+)-(?P<last>.+?)_(?P<count>\d+)f_m(?P<method>[A-Z0-9]+)_s(?P<smoothing>\d+)_r(?P<radius>\d+)_stacked$",
+    r"^-(?P<first>.+)-(?P<last>.+?)_(?P<count>\d+)f_m(?P<method>[A-Z0-9]+)_s(?P<smoothing>\d+)_r(?P<radius>\d+)_stacked(?:-Edit)?$",
     re.IGNORECASE,
 )
 EXTERNAL_RESULT_PATTERN = re.compile(
-    r"^(?P<last>.+)\s+\((?P<count>\d+)\s+files\)$",
+    r"^(?P<last>.+)\s+\((?P<count>\d+)\s+files\)(?:-Edit)?$",
+    re.IGNORECASE,
+)
+HELICON_LEGACY_PATTERN = re.compile(
+    r"^(?P<first>.+?)-(?P<count>\d+)\((?P<method>[A-Z]),R(?P<radius>\d+),S(?P<smoothing>\d+)\)(?:-Edit)?$",
     re.IGNORECASE,
 )
 
@@ -246,6 +258,24 @@ def parse_result_file_info(path: Path) -> Optional[Dict]:
             "kind": "plugin",
             "first_stem": match.group("first"),
             "last_stem": match.group("last"),
+            "count": int(match.group("count")),
+            "method": match.group("method"),
+            "smoothing": int(match.group("smoothing")),
+            "radius": int(match.group("radius")),
+        }
+
+    match = HELICON_LEGACY_PATTERN.match(stem)
+    if match:
+        # Helicon 6.x naming used the FIRST source file's stem followed by the
+        # frame count. We don't know the last stem from the filename alone, so
+        # leave last_stem unset and let attach_result_files_to_stacks match by
+        # (first_stem, count). Heuristic correlation is the fallback if needed.
+        return {
+            "path": str(path),
+            "filename": path.name,
+            "kind": "external",
+            "first_stem": match.group("first"),
+            "last_stem": None,
             "count": int(match.group("count")),
             "method": match.group("method"),
             "smoothing": int(match.group("smoothing")),
@@ -1147,39 +1177,54 @@ def find_directories_with_raw_files(root: Path,
     Skips 'results' directories from older/generated-output workflows so they
     are not re-scanned as candidate source folders.
     """
+    sorted_dirs, _ = walk_raw_directories(root, timer=timer)
+    return sorted_dirs
+
+
+def walk_raw_directories(root: Path,
+                         timer: Optional[StageTimer] = None
+                         ) -> Tuple[List[Path], Dict[str, List[str]]]:
+    """Single tree walk that returns both directories and files per directory.
+
+    The pre-existing find_directories_with_raw_files inspected file extensions
+    inside os.walk anyway; collecting the matching paths costs essentially
+    nothing beyond what we already paid. Doing this once on the Python side
+    is cheaper than letting Lua re-walk every directory through LrFileUtils
+    over a slow network volume.
+    """
     skip_names = {'results'}
-    directories = []
+    files_by_dir: Dict[str, List[str]] = {}
 
     track = timer.track("directory_walk") if timer is not None else None
     if track is not None:
         track.__enter__()
     try:
         for dirpath, dirnames, filenames in os.walk(root):
-            # Prune skipped directory names
             dirnames[:] = [d for d in dirnames if d not in skip_names]
-
-            # Check if this directory has any raw files
-            has_raw = any(
-                Path(f).suffix.lower() in RAW_EXTENSIONS
-                for f in filenames
+            raw_paths = sorted(
+                str(Path(dirpath) / fn)
+                for fn in filenames
+                if Path(fn).suffix.lower() in RAW_EXTENSIONS
             )
-            if has_raw:
-                directories.append(Path(dirpath))
+            if raw_paths:
+                files_by_dir[dirpath] = raw_paths
     finally:
         if track is not None:
             track.__exit__(None, None, None)
 
-    return sorted(directories)
+    sorted_paths = sorted(files_by_dir.keys())
+    return [Path(p) for p in sorted_paths], files_by_dir
 
 
 def list_directories_with_raw_files(root: Path) -> Dict:
     """Return a lightweight directory listing for progress reporting."""
     timer = StageTimer()
-    directories = find_directories_with_raw_files(root, timer=timer)
+    directories, files_by_dir = walk_raw_directories(root, timer=timer)
     return {
         "root": str(root),
         "directories_scanned": len(directories),
         "directories": [str(directory) for directory in directories],
+        "directory_files": files_by_dir,
         "_timing": timer.to_dict(),
     }
 

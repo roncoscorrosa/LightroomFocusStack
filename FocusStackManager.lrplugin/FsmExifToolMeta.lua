@@ -72,9 +72,12 @@ local function nextTmpPath(suffix)
     return LrPathUtils.child(tempDir, name)
 end
 
+-- Returns metadata, photosByPath. ExifTool has no catalog access, so the
+-- second return is always an empty table; callers that need photo objects
+-- will fall back to catalog:findPhotoByPath.
 function FsmExifToolMeta.getMetadataForFiles(exiftoolPath, filePaths)
     if not filePaths or #filePaths == 0 then
-        return {}
+        return {}, {}
     end
 
     local exiftool = resolveExiftool(exiftoolPath)
@@ -105,7 +108,7 @@ function FsmExifToolMeta.getMetadataForFiles(exiftoolPath, filePaths)
     end
 
     if stdout == "" then
-        return {}
+        return {}, {}
     end
 
     local entries = ScriptBridge.parseJSON(stdout)
@@ -117,7 +120,7 @@ function FsmExifToolMeta.getMetadataForFiles(exiftoolPath, filePaths)
             end
         end
     end
-    return result
+    return result, {}
 end
 
 return FsmExifToolMeta
