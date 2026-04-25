@@ -1058,19 +1058,36 @@ class TestFindDirectoriesWithRawFiles(TestCase):
             (d1 / "root.dng").touch()
             (d2 / "lupine.dng").touch()
             (d2 / "rose.cr3").touch()
+            # A TIF render-result candidate next to its source raws — the
+            # catalog provider will be asked for it so heuristic correlation
+            # can use its timestamp/EXIF when filename matching falls short.
+            (d2 / "merged.tif").touch()
 
             result = list_directories_with_raw_files(Path(tmpdir))
 
         self.assertEqual(result["root"], tmpdir)
         self.assertEqual(result["directories_scanned"], 2)
         self.assertEqual(result["directories"], [str(d1), str(d2)])
-        # Each directory's raw files are captured during the same walk so
-        # callers don't have to re-enumerate.
         self.assertEqual(result["directory_files"][str(d1)], [str(d1 / "root.dng")])
+        # Raws come first alphabetically, the TIF is included in the same list.
         self.assertEqual(
             result["directory_files"][str(d2)],
-            [str(d2 / "lupine.dng"), str(d2 / "rose.cr3")],
+            [str(d2 / "lupine.dng"), str(d2 / "merged.tif"), str(d2 / "rose.cr3")],
         )
+
+    def test_list_directories_skips_dirs_with_only_render_candidates(self):
+        # A directory that has TIF/PSD but no raw is not a source folder; we
+        # don't want to scan it as if it were.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            edits = Path(tmpdir) / "edits"
+            edits.mkdir()
+            (edits / "edit.tif").touch()
+
+            result = list_directories_with_raw_files(Path(tmpdir))
+
+        self.assertEqual(result["directories_scanned"], 0)
+        self.assertEqual(result["directories"], [])
+        self.assertEqual(result["directory_files"], {})
 
 
 class TestResultFileDetection(TestCase):
@@ -1091,23 +1108,24 @@ class TestResultFileDetection(TestCase):
         self.assertTrue(is_known_result_filename(Path("_ON_4708 (6 files)-Edit.tif")))
         self.assertTrue(is_known_result_filename(Path("-_ON_1000-_ON_1009_10f_mB_s5_r11_stacked-Edit.tif")))
 
-    def test_helicon_legacy_result_is_parsed_with_first_stem(self):
+    def test_helicon_legacy_result_is_parsed_with_last_stem(self):
+        # Helicon 6.x names results after the LAST source file in the sequence.
         from detect_stacks import parse_result_file_info
         info = parse_result_file_info(Path("_ON_1349-6(B,R8,S4).dng"))
         self.assertEqual(info["kind"], "external")
-        self.assertEqual(info["first_stem"], "_ON_1349")
-        self.assertIsNone(info["last_stem"])
+        self.assertIsNone(info["first_stem"])
+        self.assertEqual(info["last_stem"], "_ON_1349")
         self.assertEqual(info["count"], 6)
         self.assertEqual(info["method"], "B")
         self.assertEqual(info["radius"], 8)
         self.assertEqual(info["smoothing"], 4)
 
-    def test_helicon_legacy_result_attaches_to_stack_by_first_stem_and_count(self):
+    def test_helicon_legacy_result_attaches_to_stack_by_last_stem_and_count(self):
         from detect_stacks import parse_result_file_info, attach_result_files_to_stacks
         stack = FocusStack(
-            name="_ON_1349-_ON_1354",
+            name="_ON_1344-_ON_1349",
             count=6,
-            files=[f"/tmp/_ON_{n}.cr3" for n in range(1349, 1355)],
+            files=[f"/tmp/_ON_{n}.cr3" for n in range(1344, 1350)],
             focal_length=None,
             iso=None,
             aperture=None,
@@ -1118,6 +1136,155 @@ class TestResultFileDetection(TestCase):
         )
         result_info = parse_result_file_info(Path("/tmp/_ON_1349-6(B,R8,S4).dng"))
         attached = attach_result_files_to_stacks([stack], [result_info])
+        self.assertEqual(len(attached[0]["result_files"]), 1)
+
+    def test_heuristic_correlation_attaches_subset_merge(self):
+        # The user shot 8 frames at the same settings but only merged 5 of
+        # them in Helicon. Detection sees one 8-frame stack; the result file
+        # claims count=5 with last_stem somewhere in the middle of the range.
+        # Heuristic correlation should still attach the result based on EXIF
+        # timing + camera settings, with last_stem as a frame-membership
+        # signal — count equality is not required.
+        from detect_stacks import find_heuristic_result_match, ImageMetadata
+        base = datetime(2023, 11, 6, 10, 46, 0)
+        files = [f"/tmp/_ON_{n}.cr3" for n in range(1538, 1546)]  # 1538..1545
+        metadata_by_path = {
+            f: ImageMetadata(
+                filepath=f,
+                filename=Path(f).name,
+                timestamp=base + timedelta(seconds=i * 0.6),
+                focal_length=200.0, iso=400, aperture=11.0,
+                shutter_speed="1/15", exposure_time_seconds=0.0666,
+                exposure_mode="Manual",
+            ) for i, f in enumerate(files)
+        }
+        stack = FocusStack(
+            name="_ON_1538-_ON_1545",
+            count=8,
+            files=files,
+            focal_length=200.0, iso=400, aperture=11.0, shutter_speed="1/15",
+            time_span_seconds=4.2, first_image_time="2023-11-06 10:46:00",
+            last_exposure_time_seconds=0.0666,
+        )
+        # Result file's filename says 5 frames ending at _ON_1542 — that's a
+        # subset of our 8-frame detection. Result timestamp lands somewhere in
+        # the stack's time window.
+        result = {
+            "path": "/tmp/_ON_1542-5(B,R8,S4).dng",
+            "filename": "_ON_1542-5(B,R8,S4).dng",
+            "kind": "external",
+            "first_stem": None,
+            "last_stem": "_ON_1542",
+            "count": 5,
+            "timestamp": (base + timedelta(seconds=2.4)).isoformat(),
+            "focal_length": 200.0,
+            "iso": 400,
+            "aperture": 11.0,
+            "shutter_speed": "1/15",
+        }
+        match = find_heuristic_result_match([stack], result, metadata_by_path)
+        self.assertEqual(match, "_ON_1538-_ON_1545")
+
+    def test_heuristic_correlation_falls_back_to_timing_when_stem_unrelated(self):
+        # Real case: user renames the LR edit copy of a Helicon result with a
+        # prefix (e.g. "vertical_ON_3059...") so the parsed last_stem isn't a
+        # real source frame. Timing + EXIF still uniquely identify the stack;
+        # we should attach via the timing-only fallback rather than reject.
+        from detect_stacks import find_heuristic_result_match, ImageMetadata
+        base = datetime(2023, 11, 6, 10, 46, 0)
+        files = [f"/tmp/_ON_{n}.cr3" for n in range(1538, 1546)]
+        metadata_by_path = {
+            f: ImageMetadata(
+                filepath=f, filename=Path(f).name,
+                timestamp=base + timedelta(seconds=i * 0.6),
+                focal_length=200.0, iso=400, aperture=11.0,
+                shutter_speed="1/15", exposure_time_seconds=0.0666,
+                exposure_mode="Manual",
+            ) for i, f in enumerate(files)
+        }
+        stack = FocusStack(
+            name="_ON_1538-_ON_1545", count=8, files=files,
+            focal_length=200.0, iso=400, aperture=11.0, shutter_speed="1/15",
+            time_span_seconds=4.2, first_image_time="2023-11-06 10:46:00",
+            last_exposure_time_seconds=0.0666,
+        )
+        result = {
+            "path": "/tmp/vertical_ON_1542-5(B,R8,S4).dng",
+            "filename": "vertical_ON_1542-5(B,R8,S4).dng",
+            "kind": "external", "first_stem": None,
+            "last_stem": "vertical_ON_1542",  # not a real frame stem
+            "count": 5,
+            "timestamp": (base + timedelta(seconds=2.4)).isoformat(),
+            "focal_length": 200.0, "iso": 400, "aperture": 11.0,
+            "shutter_speed": "1/15",
+        }
+        self.assertEqual(
+            find_heuristic_result_match([stack], result, metadata_by_path),
+            "_ON_1538-_ON_1545",
+        )
+
+    def test_heuristic_correlation_skips_when_timing_match_is_ambiguous(self):
+        # Two stacks with the same camera settings shot back-to-back; a result
+        # file with a renamed (unrelated) stem and a timestamp that fits both
+        # stacks' time windows is too ambiguous to attach to either.
+        from detect_stacks import find_heuristic_result_match, ImageMetadata
+        base = datetime(2023, 11, 6, 10, 46, 0)
+
+        def metadata_for(files, start_offset):
+            return {
+                f: ImageMetadata(
+                    filepath=f, filename=Path(f).name,
+                    timestamp=base + timedelta(seconds=start_offset + i * 0.6),
+                    focal_length=200.0, iso=400, aperture=11.0,
+                    shutter_speed="1/15", exposure_time_seconds=0.0666,
+                    exposure_mode="Manual",
+                ) for i, f in enumerate(files)
+            }
+
+        files_a = [f"/tmp/_ON_{n}.cr3" for n in range(1538, 1546)]
+        files_b = [f"/tmp/_ON_{n}.cr3" for n in range(1546, 1554)]
+        metadata_by_path = {**metadata_for(files_a, 0), **metadata_for(files_b, 5.0)}
+
+        stack_a = FocusStack(
+            name="_ON_1538-_ON_1545", count=8, files=files_a,
+            focal_length=200.0, iso=400, aperture=11.0, shutter_speed="1/15",
+            time_span_seconds=4.2, first_image_time="2023-11-06 10:46:00",
+            last_exposure_time_seconds=0.0666,
+        )
+        stack_b = FocusStack(
+            name="_ON_1546-_ON_1553", count=8, files=files_b,
+            focal_length=200.0, iso=400, aperture=11.0, shutter_speed="1/15",
+            time_span_seconds=4.2, first_image_time="2023-11-06 10:46:05",
+            last_exposure_time_seconds=0.0666,
+        )
+        # Result timestamp falls inside stack A but with the +1s slack that
+        # follows stack A and the -1s look-behind for stack B, both match.
+        # Stem isn't in either stack → no high-confidence pick → ambiguous.
+        result = {
+            "path": "/tmp/renamed-5(B,R8,S4).dng",
+            "filename": "renamed-5(B,R8,S4).dng",
+            "kind": "external", "first_stem": None, "last_stem": "renamed",
+            "count": 5,
+            "timestamp": (base + timedelta(seconds=4.5)).isoformat(),
+            "focal_length": 200.0, "iso": 400, "aperture": 11.0,
+            "shutter_speed": "1/15",
+        }
+        self.assertIsNone(find_heuristic_result_match([stack_a, stack_b], result, metadata_by_path))
+
+    def test_helicon_legacy_edit_tif_attaches_to_same_stack(self):
+        # The LR -Edit copy of a Helicon-rendered DNG should hit the same
+        # filename-based attach path (no catalog metadata required).
+        from detect_stacks import parse_result_file_info, attach_result_files_to_stacks
+        stack = FocusStack(
+            name="_ON_1344-_ON_1349",
+            count=6,
+            files=[f"/tmp/_ON_{n}.cr3" for n in range(1344, 1350)],
+            focal_length=None, iso=None, aperture=None, shutter_speed=None,
+            time_span_seconds=0.0, first_image_time=None,
+            last_exposure_time_seconds=None,
+        )
+        info = parse_result_file_info(Path("/tmp/_ON_1349-6(B,R8,S4)-Edit.tif"))
+        attached = attach_result_files_to_stacks([stack], [info])
         self.assertEqual(len(attached[0]["result_files"]), 1)
 
     def test_rendered_linear_raw_dng_is_result(self):

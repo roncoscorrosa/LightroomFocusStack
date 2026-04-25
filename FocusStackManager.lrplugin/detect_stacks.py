@@ -133,7 +133,7 @@ EXTERNAL_RESULT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 HELICON_LEGACY_PATTERN = re.compile(
-    r"^(?P<first>.+?)-(?P<count>\d+)\((?P<method>[A-Z]),R(?P<radius>\d+),S(?P<smoothing>\d+)\)(?:-Edit)?$",
+    r"^(?P<last>.+?)-(?P<count>\d+)\((?P<method>[A-Z]),R(?P<radius>\d+),S(?P<smoothing>\d+)\)(?:-Edit)?$",
     re.IGNORECASE,
 )
 
@@ -266,16 +266,16 @@ def parse_result_file_info(path: Path) -> Optional[Dict]:
 
     match = HELICON_LEGACY_PATTERN.match(stem)
     if match:
-        # Helicon 6.x naming used the FIRST source file's stem followed by the
-        # frame count. We don't know the last stem from the filename alone, so
-        # leave last_stem unset and let attach_result_files_to_stacks match by
-        # (first_stem, count). Heuristic correlation is the fallback if needed.
+        # Helicon 6.x default save name uses the LAST source file's stem
+        # followed by the frame count and parameter shorthand. We leave
+        # first_stem unset and let attach_result_files_to_stacks correlate
+        # by (last_stem, count); heuristic EXIF correlation is the fallback.
         return {
             "path": str(path),
             "filename": path.name,
             "kind": "external",
-            "first_stem": match.group("first"),
-            "last_stem": None,
+            "first_stem": None,
+            "last_stem": match.group("last"),
             "count": int(match.group("count")),
             "method": match.group("method"),
             "smoothing": int(match.group("smoothing")),
@@ -359,7 +359,16 @@ def _matches_stack_signature(stack: FocusStack, result: Dict) -> bool:
 def find_heuristic_result_match(stacks: List[FocusStack],
                                 result: Dict,
                                 metadata_by_path: Dict[str, ImageMetadata]) -> Optional[str]:
-    """Return a stack name for a unique, high-confidence heuristic result match."""
+    """Return a stack name for a unique, high-confidence heuristic result match.
+
+    Matches by camera-settings signature + result-timestamp falling within the
+    stack's time bounds. Does NOT require the frame count to match: Helicon
+    may have merged a subset of a longer detected sequence (the user shot
+    extra frames at the same settings but didn't include them all in the
+    merge). When the filename parser extracted a first/last source-frame
+    stem, that stem must be a member of the candidate stack's source files —
+    a stronger positive signal than count equality.
+    """
     result_timestamp = result.get("timestamp")
     if isinstance(result_timestamp, str):
         try:
@@ -369,12 +378,17 @@ def find_heuristic_result_match(stacks: List[FocusStack],
     if result_timestamp is None:
         return None
 
-    matches = []
+    result_last = result.get("last_stem")
+    result_first = result.get("first_stem")
+
+    # Two confidence tiers: stacks where the parsed source-frame stem is an
+    # actual member of the stack (high) vs. stacks that match purely on
+    # timing+EXIF (medium, used as fallback when the user renamed the result
+    # file or the parsed stem is otherwise unrelated to any source frame).
+    high_confidence = []
+    timing_only = []
     for stack in stacks:
         if not _matches_stack_signature(stack, result):
-            continue
-
-        if result.get("count") is not None and result["count"] != stack.count:
             continue
 
         start_time, end_time = _stack_time_bounds(stack, metadata_by_path)
@@ -387,10 +401,23 @@ def find_heuristic_result_match(stacks: List[FocusStack],
         if not (lower_bound <= result_timestamp <= upper_bound):
             continue
 
-        matches.append(stack.name)
+        stem_in_stack = True
+        if result_last is not None or result_first is not None:
+            stack_stems = {Path(f).stem for f in stack.files}
+            if result_last is not None and result_last not in stack_stems:
+                stem_in_stack = False
+            if result_first is not None and result_first not in stack_stems:
+                stem_in_stack = False
 
-    if len(matches) == 1:
-        return matches[0]
+        if stem_in_stack:
+            high_confidence.append(stack.name)
+        else:
+            timing_only.append(stack.name)
+
+    if len(high_confidence) == 1:
+        return high_confidence[0]
+    if not high_confidence and len(timing_only) == 1:
+        return timing_only[0]
     return None
 
 
@@ -1186,13 +1213,15 @@ def walk_raw_directories(root: Path,
                          ) -> Tuple[List[Path], Dict[str, List[str]]]:
     """Single tree walk that returns both directories and files per directory.
 
-    The pre-existing find_directories_with_raw_files inspected file extensions
-    inside os.walk anyway; collecting the matching paths costs essentially
-    nothing beyond what we already paid. Doing this once on the Python side
-    is cheaper than letting Lua re-walk every directory through LrFileUtils
-    over a slow network volume.
+    Returns directories that contain at least one raw file. For each such
+    directory, files_by_dir lists every file matching either RAW_EXTENSIONS
+    or RENDERED_RESULT_EXTENSIONS (TIF/TIFF/PSD) — both groups are useful to
+    the catalog metadata provider, which can resolve timestamps and EXIF for
+    LR-imported edit copies and feed the heuristic result-correlation step.
+    Files whose extension is in neither set are ignored.
     """
     skip_names = {'results'}
+    relevant_extensions = RAW_EXTENSIONS | RENDERED_RESULT_EXTENSIONS
     files_by_dir: Dict[str, List[str]] = {}
 
     track = timer.track("directory_walk") if timer is not None else None
@@ -1201,13 +1230,16 @@ def walk_raw_directories(root: Path,
     try:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in skip_names]
-            raw_paths = sorted(
-                str(Path(dirpath) / fn)
-                for fn in filenames
-                if Path(fn).suffix.lower() in RAW_EXTENSIONS
-            )
-            if raw_paths:
-                files_by_dir[dirpath] = raw_paths
+            has_raw = False
+            relevant_paths: List[str] = []
+            for fn in filenames:
+                ext = Path(fn).suffix.lower()
+                if ext in relevant_extensions:
+                    relevant_paths.append(str(Path(dirpath) / fn))
+                    if ext in RAW_EXTENSIONS:
+                        has_raw = True
+            if has_raw:
+                files_by_dir[dirpath] = sorted(relevant_paths)
     finally:
         if track is not None:
             track.__exit__(None, None, None)
