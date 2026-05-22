@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -220,39 +221,49 @@ def process_stack(files: List[str],
     # originals stay in place while the input folder contains only this stack.
     symlink_dir = create_symlink_dir(files)
 
+    # HF9 beta has a bug parsing -save: when the value contains spaces — it
+    # splits the value at the space and treats the second half as a separate
+    # positional arg, producing "Only one directory can be specified on the
+    # command line". Workaround: render to a no-space temp path (macOS
+    # default tempdir under /var/folders/ has no spaces), then move to the
+    # real destination. Safe to keep once Helicon fixes the parser; can be
+    # removed later if the indirection is undesired.
     try:
-        cmd = [
-            str(hf_path),
-            "-silent",
-            str(symlink_dir),
-            f"-save:{output_path}",
-            f"-mp:{method}",
-            f"-rp:{radius}",
-            f"-sp:{smoothing}",
-        ]
+        with tempfile.TemporaryDirectory(prefix="helicon_render_") as render_dir:
+            temp_output_path = Path(render_dir) / output_path.name
+            cmd = [
+                str(hf_path),
+                "-silent",
+                str(symlink_dir),
+                f"-save:{temp_output_path}",
+                f"-mp:{method}",
+                f"-rp:{radius}",
+                f"-sp:{smoothing}",
+            ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
 
-        if result.returncode == 0 and output_path.exists():
-            return {
-                "success": True,
-                "result_file": str(output_path),
-                "already_existed": False,
-                "stack_name": f"{Path(files[0]).stem}-{Path(files[-1]).stem}",
-                "command": " ".join(cmd),
-            }
-        else:
-            details = summarize_helicon_output(stdout, stderr)
-            return {
-                "success": False,
-                "error": f"Helicon Focus failed (exit code {result.returncode}): {details}",
-                "stack_name": f"{Path(files[0]).stem}-{Path(files[-1]).stem}",
-                "command": " ".join(cmd),
-                "stdout": stdout,
-                "stderr": stderr,
-            }
+            if result.returncode == 0 and temp_output_path.exists():
+                shutil.move(str(temp_output_path), str(output_path))
+                return {
+                    "success": True,
+                    "result_file": str(output_path),
+                    "already_existed": False,
+                    "stack_name": f"{Path(files[0]).stem}-{Path(files[-1]).stem}",
+                    "command": " ".join(cmd),
+                }
+            else:
+                details = summarize_helicon_output(stdout, stderr)
+                return {
+                    "success": False,
+                    "error": f"Helicon Focus failed (exit code {result.returncode}): {details}",
+                    "stack_name": f"{Path(files[0]).stem}-{Path(files[-1]).stem}",
+                    "command": " ".join(cmd),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
 
     except subprocess.TimeoutExpired:
         return {

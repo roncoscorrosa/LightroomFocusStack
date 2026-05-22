@@ -256,10 +256,16 @@ class TestProcessStack(TestCase):
 
             mock_hf.return_value = Path("/mock/HeliconFocus")
 
-            def fake_helicon(*args, **kwargs):
-                # Simulate Helicon creating the output file
+            def fake_helicon(cmd, *args, **kwargs):
+                # Simulate Helicon writing to whichever -save: path we passed.
+                # The real flow writes to a no-space temp path (HF9 bug
+                # workaround) and the caller then moves it to the final
+                # destination — the mock just creates the temp file.
                 output_dir.mkdir(parents=True, exist_ok=True)
-                expected_result.write_text("stacked result")
+                save_arg = next(a for a in cmd if a.startswith("-save:"))
+                temp_path = Path(save_arg[len("-save:"):])
+                temp_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path.write_text("stacked result")
                 return MagicMock(returncode=0, stderr="")
 
             mock_run.side_effect = fake_helicon
@@ -272,10 +278,15 @@ class TestProcessStack(TestCase):
             self.assertTrue(result["success"])
             self.assertFalse(result.get("already_existed", False))
             self.assertEqual(result["result_file"], str(expected_result))
+            self.assertTrue(expected_result.exists())
             run_args = mock_run.call_args[0][0]
             self.assertEqual(run_args[1], "-silent")
             self.assertNotEqual(run_args[2], "-i")
             self.assertIn("helicon_stack_", run_args[2])
+            # The -save: path is a temp directory, not the final destination,
+            # so spaces in the user's library path never reach HF's parser.
+            save_arg = next(a for a in run_args if a.startswith("-save:"))
+            self.assertNotIn(" ", save_arg)
 
     @patch('process_stack.subprocess.run')
     @patch('process_stack.get_helicon_focus_path')
