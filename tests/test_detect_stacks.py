@@ -40,7 +40,8 @@ from detect_stacks import (
 def make_metadata(filename, timestamp, focal_length=100.0, iso=200,
                   aperture=11.0, shutter_speed="1/4",
                   exposure_time_seconds=0.25, exposure_mode="Manual",
-                  directory="/fake/path"):
+                  directory="/fake/path",
+                  focus_bracketing=None, focus_bracket_image_count=None):
     """Helper to create ImageMetadata with sensible defaults."""
     return ImageMetadata(
         filepath=os.path.join(directory, filename),
@@ -52,6 +53,8 @@ def make_metadata(filename, timestamp, focal_length=100.0, iso=200,
         shutter_speed=shutter_speed,
         exposure_time_seconds=exposure_time_seconds,
         exposure_mode=exposure_mode,
+        focus_bracketing=focus_bracketing,
+        focus_bracket_image_count=focus_bracket_image_count,
     )
 
 
@@ -104,6 +107,292 @@ def make_exiftool_batch(images, focus_distances=None):
         fd = focus_distances.get(img.filepath) if focus_distances else None
         result[img.filepath] = metadata_to_exiftool_entry(img, focus_distance=fd)
     return result
+
+
+class TestParseFocusDistance(TestCase):
+    def test_plain_number(self):
+        from detect_stacks import parse_focus_distance
+        self.assertAlmostEqual(parse_focus_distance(5.12), 5.12)
+        self.assertAlmostEqual(parse_focus_distance("5.12"), 5.12)
+
+    def test_canon_lower_format_with_meters(self):
+        from detect_stacks import parse_focus_distance
+        self.assertAlmostEqual(parse_focus_distance("55.78 m"), 55.78)
+        self.assertAlmostEqual(parse_focus_distance("1m"), 1.0)
+
+    def test_canon_upper_inf(self):
+        from detect_stacks import parse_focus_distance
+        self.assertEqual(parse_focus_distance("inf"), float("inf"))
+        self.assertEqual(parse_focus_distance("infinity"), float("inf"))
+
+    def test_unparseable(self):
+        from detect_stacks import parse_focus_distance
+        self.assertIsNone(parse_focus_distance(None))
+        self.assertIsNone(parse_focus_distance(""))
+        self.assertIsNone(parse_focus_distance("abc"))
+
+
+class TestExtractFocusDistance(TestCase):
+    def test_prefers_approximate_focus_distance(self):
+        from detect_stacks import extract_focus_distance
+        entry = {
+            "ApproximateFocusDistance": "5.12",
+            "FocusDistanceLower": "100.0 m",
+        }
+        self.assertAlmostEqual(extract_focus_distance(entry), 5.12)
+
+    def test_falls_back_to_canon_lower(self):
+        from detect_stacks import extract_focus_distance
+        entry = {"FocusDistanceLower": "55.78 m", "FocusDistanceUpper": "inf"}
+        self.assertAlmostEqual(extract_focus_distance(entry), 55.78)
+
+    def test_falls_back_to_canon_upper_when_lower_missing(self):
+        from detect_stacks import extract_focus_distance
+        entry = {"FocusDistanceUpper": "10.5 m"}
+        self.assertAlmostEqual(extract_focus_distance(entry), 10.5)
+
+    def test_returns_none_when_no_known_tag(self):
+        from detect_stacks import extract_focus_distance
+        self.assertIsNone(extract_focus_distance({}))
+        self.assertIsNone(extract_focus_distance({"ISO": 100}))
+
+
+class TestHasVaryingFocusDistanceWithInfinity(TestCase):
+    def test_all_infinity_treated_as_constant(self):
+        # All frames at infinity is treated the same as any other constant-
+        # distance burst: rejected. The alternative (keep all-inf) admitted
+        # too many wind/wave bursts at infinity for the cost of catching a
+        # rare legitimate landscape-stack-at-infinity. EXIF "infinity"
+        # collapses both into the same signal; we can't tell them apart.
+        from detect_stacks import has_varying_focus_distance
+        files = [f"/tmp/_ON_{n}.dng" for n in range(1, 6)]
+        focus = {fp: float("inf") for fp in files}
+        self.assertFalse(has_varying_focus_distance(files, focus))
+
+    def test_infinity_mixed_with_finite_is_varying(self):
+        from detect_stacks import has_varying_focus_distance
+        files = [f"/tmp/_ON_{n}.cr3" for n in range(1, 6)]
+        # Genuine focus motion: pulls from a near subject out to infinity.
+        focus = {files[0]: 2.5, files[1]: 4.0, files[2]: 8.0,
+                 files[3]: 20.0, files[4]: float("inf")}
+        self.assertTrue(has_varying_focus_distance(files, focus))
+
+    def test_all_same_finite_distance_still_rejected(self):
+        # Wind-timing or burst at a known finite distance is still caught.
+        from detect_stacks import has_varying_focus_distance
+        files = [f"/tmp/_ON_{n}.cr3" for n in range(1, 6)]
+        focus = {fp: 5.0 for fp in files}
+        self.assertFalse(has_varying_focus_distance(files, focus))
+
+
+class TestExtractFocusBracketing(TestCase):
+    def test_on(self):
+        from detect_stacks import extract_focus_bracketing
+        self.assertTrue(extract_focus_bracketing({"FocusBracketing": "On"}))
+        self.assertTrue(extract_focus_bracketing({"FocusBracketing": "Enable"}))
+        self.assertTrue(extract_focus_bracketing({"FocusBracketing": 1}))
+
+    def test_off(self):
+        from detect_stacks import extract_focus_bracketing
+        self.assertFalse(extract_focus_bracketing({"FocusBracketing": "Off"}))
+        self.assertFalse(extract_focus_bracketing({"FocusBracketing": "Disable"}))
+
+    def test_absent(self):
+        from detect_stacks import extract_focus_bracketing
+        self.assertIsNone(extract_focus_bracketing({}))
+
+
+class TestSplitSequenceByFocusBracketing(TestCase):
+    def _seq(self, count, start=1000, fb=None, count_cap=None):
+        base = datetime(2026, 1, 15, 8, 30, 0)
+        return [
+            make_metadata(
+                filename=f"_ON_{start + i}.cr3",
+                timestamp=base + timedelta(seconds=i * 0.2),
+                focus_bracketing=fb,
+                focus_bracket_image_count=count_cap,
+            ) for i in range(count)
+        ]
+
+    def test_no_fb_signal_passes_through(self):
+        # No frame has FB tag (e.g. DNG library) — return sequence unchanged.
+        from detect_stacks import split_sequence_by_focus_bracketing
+        seq = self._seq(9, fb=None)
+        result = split_sequence_by_focus_bracketing(seq, min_sequence_length=4)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]), 9)
+
+    def test_fb_on_split_by_image_count(self):
+        # 18 frames all FB=On with ImageCount=9 → two stacks of 9 (back-to-back
+        # focus brackets that landed in the same temporal grouping).
+        from detect_stacks import split_sequence_by_focus_bracketing
+        seq = self._seq(18, fb=True, count_cap=9)
+        result = split_sequence_by_focus_bracketing(seq, min_sequence_length=4)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(len(result[0]), 9)
+        self.assertEqual(len(result[1]), 9)
+
+    def test_fb_state_transition_splits(self):
+        # FB=On for first 5 frames, then FB=Off for next 4 — split at boundary.
+        from detect_stacks import split_sequence_by_focus_bracketing
+        seq = (self._seq(5, start=1000, fb=True, count_cap=5)
+               + self._seq(4, start=2000, fb=False))
+        result = split_sequence_by_focus_bracketing(seq, min_sequence_length=4)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(len(result[0]), 5)
+        self.assertEqual(len(result[1]), 4)
+
+    def test_short_remainder_dropped(self):
+        # 11 frames FB=On with ImageCount=9: first 9 form a stack, remaining
+        # 2 are below min_sequence_length and are dropped.
+        from detect_stacks import split_sequence_by_focus_bracketing
+        seq = self._seq(11, fb=True, count_cap=9)
+        result = split_sequence_by_focus_bracketing(seq, min_sequence_length=4)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]), 9)
+
+    def test_fb_on_without_image_count_kept_whole(self):
+        # FB=On but no ImageCount tag — no information to split, keep as-is.
+        from detect_stacks import split_sequence_by_focus_bracketing
+        seq = self._seq(20, fb=True, count_cap=None)
+        result = split_sequence_by_focus_bracketing(seq, min_sequence_length=4)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]), 20)
+
+
+class TestFocusBracketingOverridesValidation(TestCase):
+    """FocusBracketing=On accepts the stack even when focus distance is
+    constant — the camera explicitly recorded that the photographer was
+    bracketing focus."""
+
+    @patch('detect_stacks.batch_extract_metadata')
+    def test_all_fb_on_overrides_constant_focus_distance(self, mock_batch):
+        # Simulate a CR3 focus bracket at infinity: ApproximateFocusDistance
+        # is constant (all "infinity"), but FocusBracketing is On for every
+        # frame. Without the override, this would be rejected. With it, kept.
+        base = datetime(2026, 5, 15, 19, 55, 28)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = []
+            for i in range(9):
+                images.append(make_metadata(
+                    filename=f"_ON_{5088 + i}.cr3",
+                    timestamp=base + timedelta(seconds=i * 0.16),
+                    focal_length=500.0, iso=200, aperture=16.0,
+                    shutter_speed="1/13", exposure_time_seconds=0.0769,
+                    directory=tmpdir,
+                    focus_bracketing=True,
+                    focus_bracket_image_count=9,
+                ))
+            for img in images:
+                Path(img.filepath).touch()
+
+            # All frames at infinity — would normally be rejected.
+            mock_batch.return_value = {
+                img.filepath: metadata_to_exiftool_entry(img, focus_distance=float("inf"))
+                for img in images
+            }
+            # Add FB=On to each mock entry so the metadata-parse picks it up.
+            for img in images:
+                mock_batch.return_value[img.filepath]["FocusBracketing"] = "On"
+                mock_batch.return_value[img.filepath]["FocusBracketingImageCount"] = 9
+
+            result = detect_stacks(Path(tmpdir))
+
+        self.assertEqual(len(result["stacks"]), 1)
+        self.assertEqual(result["stacks"][0]["count"], 9)
+        self.assertEqual(len(result["rejected_stacks"]), 0)
+
+    @patch('detect_stacks.batch_extract_metadata')
+    def test_fb_off_still_rejected_when_focus_constant(self, mock_batch):
+        # FB=Off, all frames constant focus → still rejected (wind burst).
+        base = datetime(2026, 5, 15, 16, 41, 55)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = []
+            for i in range(6):
+                images.append(make_metadata(
+                    filename=f"_ON_{4830 + i}.cr3",
+                    timestamp=base + timedelta(seconds=i * 0.7),
+                    focal_length=186.0, iso=400, aperture=16.0,
+                    shutter_speed="1/160", exposure_time_seconds=0.00625,
+                    directory=tmpdir,
+                    focus_bracketing=False,
+                ))
+            for img in images:
+                Path(img.filepath).touch()
+
+            mock_batch.return_value = {
+                img.filepath: metadata_to_exiftool_entry(img, focus_distance=float("inf"))
+                for img in images
+            }
+            for img in images:
+                mock_batch.return_value[img.filepath]["FocusBracketing"] = "Off"
+
+            result = detect_stacks(Path(tmpdir))
+
+        self.assertEqual(len(result["stacks"]), 0)
+        self.assertEqual(len(result["rejected_stacks"]), 1)
+
+
+class TestNoFbSignalAllInfinityIsKept(TestCase):
+    """DNG library (FB tag stripped during Adobe conversion): err on the
+    side of keeping all-infinity sequences. Caller can reject manually if
+    a sky burst slipped through; silently dropping a legitimate
+    infinity-focused focus stack is much harder to recover from."""
+
+    @patch('detect_stacks.batch_extract_metadata')
+    def test_all_infinity_kept_when_fb_tag_absent(self, mock_batch):
+        base = datetime(2026, 5, 15, 19, 55, 28)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = []
+            for i in range(9):
+                images.append(make_metadata(
+                    filename=f"_ON_{5088 + i}.dng",
+                    timestamp=base + timedelta(seconds=i * 0.16),
+                    focal_length=500.0, iso=200, aperture=16.0,
+                    shutter_speed="1/13", exposure_time_seconds=0.0769,
+                    directory=tmpdir,
+                    # focus_bracketing left None — no signal (DNG case).
+                ))
+            for img in images:
+                Path(img.filepath).touch()
+
+            # All frames at infinity. No FocusBracketing tag in the entry.
+            mock_batch.return_value = {
+                img.filepath: metadata_to_exiftool_entry(img, focus_distance=float("inf"))
+                for img in images
+            }
+
+            result = detect_stacks(Path(tmpdir))
+
+        self.assertEqual(len(result["stacks"]), 1)
+        self.assertEqual(result["stacks"][0]["count"], 9)
+        self.assertEqual(len(result["rejected_stacks"]), 0)
+
+    @patch('detect_stacks.batch_extract_metadata')
+    def test_finite_constant_still_rejected_when_fb_tag_absent(self, mock_batch):
+        # All frames at a known finite distance — still a strong wind/wave
+        # signal; reject even though FB tag is missing.
+        base = datetime(2026, 5, 15, 12, 0, 0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = []
+            for i in range(6):
+                images.append(make_metadata(
+                    filename=f"_ON_{8000 + i}.dng",
+                    timestamp=base + timedelta(seconds=i * 0.5),
+                    directory=tmpdir,
+                ))
+            for img in images:
+                Path(img.filepath).touch()
+
+            mock_batch.return_value = {
+                img.filepath: metadata_to_exiftool_entry(img, focus_distance=5.0)
+                for img in images
+            }
+
+            result = detect_stacks(Path(tmpdir))
+
+        self.assertEqual(len(result["stacks"]), 0)
+        self.assertEqual(len(result["rejected_stacks"]), 1)
 
 
 class TestParseFraction(TestCase):
@@ -1615,10 +1904,15 @@ class TestDetectStacksExternalMetadata(TestCase):
                 validate_focus_distance=True,
             )
 
-        # The bulk call was not invoked, but the targeted focus-distance call was.
+        # The bulk call was not invoked, but the targeted focus-distance call
+        # was. The targeted call asks for all known focus-distance tags so we
+        # cover Nikon/Sony (XMP-aux) and Canon (MakerNotes) in one pass.
         self.assertEqual(mock_batch.call_count, 1)
         call_kwargs = mock_batch.call_args.kwargs
-        self.assertEqual(call_kwargs.get("tags"), ["-ApproximateFocusDistance"])
+        self.assertEqual(
+            call_kwargs.get("tags"),
+            ["-ApproximateFocusDistance", "-FocusDistanceUpper", "-FocusDistanceLower"],
+        )
         self.assertEqual(len(result["stacks"]), 1)
 
     @patch('detect_stacks.batch_extract_metadata')

@@ -497,7 +497,7 @@ function DetectionService.run(scanRoot, queuePosition, queueTotal, opts)
     local provider, providerKind = buildProvider(prefs, state.catalog)
     local validateFocusDistance = prefs.validate_focus_distance
     if validateFocusDistance == nil then
-        validateFocusDistance = false
+        validateFocusDistance = true
     end
     logger:info(string.format(
         "Metadata provider: %s; focus distance validation: %s",

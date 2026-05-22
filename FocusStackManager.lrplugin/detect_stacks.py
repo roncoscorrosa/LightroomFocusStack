@@ -12,9 +12,10 @@ Detection Heuristics:
     3. Temporal proximity: Sequences where images are taken within max_gap seconds
        after the previous exposure ends (accounts for long exposure times)
     4. Minimum sequence length: Requires at least min_sequence_length images
-    5. Focus distance validation: Reads ApproximateFocusDistance (XMP-aux).
-       If all frames have the same focus distance, the sequence is rejected
-       as a false positive (e.g., wind-timing shots).
+    5. Focus distance validation: Reads ApproximateFocusDistance (XMP-aux,
+       Nikon/Sony) with fallback to FocusDistanceLower/Upper (Canon
+       MakerNotes). If all frames have the same focus distance, the
+       sequence is rejected as a false positive (e.g., wind/wave bursts).
 
 Requirements:
     exiftool (brew install exiftool)
@@ -149,6 +150,13 @@ class ImageMetadata:
     shutter_speed: Optional[str]
     exposure_time_seconds: Optional[float]
     exposure_mode: Optional[str]
+    # Canon MakerNotes: True/False if the camera explicitly recorded
+    # FocusBracketing state for this frame, None when the tag is absent
+    # (e.g., DNG conversion stripped MakerNotes, or non-Canon body).
+    focus_bracketing: Optional[bool] = None
+    # Canon FocusBracketingImageCount: total frames in the bracket the
+    # camera set up. Used to split adjacent bracket sequences.
+    focus_bracket_image_count: Optional[int] = None
 
     def get_signature(self) -> Tuple:
         return (self.focal_length, self.iso, self.aperture, self.shutter_speed)
@@ -482,13 +490,103 @@ EXIFTOOL_DEFAULT_TAGS = (
     "-FNumber",
     "-ExposureTime",
     "-ExposureMode",
+    # ApproximateFocusDistance is XMP-aux (Nikon/Sony write this natively).
+    # FocusDistanceUpper/Lower are Canon MakerNotes — required to detect
+    # constant-focus burst sequences on Canon bodies (Canon does not write
+    # ApproximateFocusDistance). MakerNotes are only surfaced with -fast,
+    # not -fast2.
     "-ApproximateFocusDistance",
+    "-FocusDistanceUpper",
+    "-FocusDistanceLower",
+    # Canon-specific MakerNotes that explicitly indicate focus bracketing.
+    # Survive in CR3 but are stripped by Adobe DNG conversion. When present
+    # they're authoritative: FB=On means the camera deliberately bracketed
+    # focus, and ImageCount gives the bracket length for splitting adjacent
+    # bracket sequences.
+    "-FocusBracketing",
+    "-FocusBracketingImageCount",
     "-PreviewApplicationName",
     "-Software",
     "-CreatorTool",
     "-PhotometricInterpretation",
     "-SamplesPerPixel",
 )
+
+FOCUS_DISTANCE_TAGS = (
+    "-ApproximateFocusDistance",
+    "-FocusDistanceUpper",
+    "-FocusDistanceLower",
+)
+
+
+def parse_focus_distance(value) -> Optional[float]:
+    """Parse a focus-distance value from any of the EXIF/XMP/MakerNotes sources.
+
+    Accepts a number, a plain numeric string ("5.12"), a string with a unit
+    suffix like Canon's "55.78 m", or the string "inf" for lens-at-infinity.
+    Returns None for unparseable input.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s in ("inf", "infinity", "infinite"):
+        return float("inf")
+    # Strip a trailing unit (" m" / "m" / " ft", etc.) — focus stacks are
+    # detected on relative change, so any consistent unit works.
+    for unit in (" m", "m", " ft", "ft"):
+        if s.endswith(unit):
+            s = s[: -len(unit)].strip()
+            break
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def extract_focus_distance(entry: dict) -> Optional[float]:
+    """Get a focus-distance value from an exiftool entry, trying known tags.
+
+    Preference order: ApproximateFocusDistance (XMP-aux, used by Nikon and
+    Sony) → FocusDistanceLower (Canon MakerNotes near-DOF limit; varies with
+    focus point so it's a good signal of focus motion) → FocusDistanceUpper
+    (Canon far-DOF limit; falls back here when Lower is missing).
+    """
+    for tag in ("ApproximateFocusDistance", "FocusDistanceLower",
+                "FocusDistanceUpper"):
+        if tag in entry:
+            parsed = parse_focus_distance(entry.get(tag))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def extract_focus_bracketing(entry: dict) -> Optional[bool]:
+    """True if FocusBracketing is on, False if explicitly off, None if absent."""
+    val = entry.get("FocusBracketing")
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in ("on", "enable", "enabled", "1", "true"):
+        return True
+    if s in ("off", "disable", "disabled", "0", "false"):
+        return False
+    return None
+
+
+def extract_focus_bracket_image_count(entry: dict) -> Optional[int]:
+    """Parse Canon's FocusBracketingImageCount tag. None if missing/unparseable."""
+    val = entry.get("FocusBracketingImageCount")
+    if val is None:
+        return None
+    try:
+        n = int(val)
+        return n if n > 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 def batch_extract_metadata(file_paths: List[str],
@@ -535,10 +633,11 @@ def batch_extract_metadata(file_paths: List[str],
         effective_tags = list(tags) if tags is not None else list(EXIFTOOL_DEFAULT_TAGS)
         cmd = [
             str(effective_exiftool),
-            # -fast2 skips reading past the metadata block (and avoids
-            # PreviewImage extraction). Benchmarked safe for our tag set on
-            # cold cache; -fast3 was ~3× faster but dropped all our tags.
-            "-fast2",
+            # -fast (not -fast2): we need MakerNotes for Canon's
+            # FocusDistanceUpper/Lower, which -fast2 strips. The cost vs
+            # -fast2 is small (~5% on cold cache) and only affects exiftool
+            # invocations; the catalog provider path is unchanged.
+            "-fast",
             "-json",
         ] + effective_tags + list(file_paths)
         if timer is not None:
@@ -616,6 +715,8 @@ def exiftool_entry_to_metadata(filepath: str, entry: dict) -> Optional[ImageMeta
         shutter_speed=shutter_speed,
         exposure_time_seconds=exposure_time_seconds,
         exposure_mode=exposure_mode,
+        focus_bracketing=extract_focus_bracketing(entry),
+        focus_bracket_image_count=extract_focus_bracket_image_count(entry),
     )
 
 
@@ -692,6 +793,67 @@ def find_temporal_sequences(images: List[ImageMetadata],
     return sequences
 
 
+def split_sequence_by_focus_bracketing(
+    sequence: List[ImageMetadata],
+    min_sequence_length: int,
+) -> List[List[ImageMetadata]]:
+    """Split a temporal sequence at focus-bracketing boundaries.
+
+    Splits the input sequence into sub-sequences whenever:
+      - consecutive frames have different FocusBracketing state (e.g. one
+        frame says On, the next says Off), or
+      - a contiguous FB=On run reaches FocusBracketingImageCount frames
+        (the camera's configured bracket size — the next frame begins a
+        new bracket sequence).
+
+    Sub-sequences shorter than min_sequence_length are dropped.
+
+    If no frame in the sequence has a FocusBracketing tag (e.g. DNGs where
+    MakerNotes were stripped), returns the original sequence unchanged.
+    """
+    has_any_fb_signal = any(img.focus_bracketing is not None for img in sequence)
+    if not has_any_fb_signal:
+        return [sequence] if len(sequence) >= min_sequence_length else []
+
+    result: List[List[ImageMetadata]] = []
+    current: List[ImageMetadata] = []
+    current_fb: Optional[bool] = None
+    current_count_cap: Optional[int] = None
+
+    def flush():
+        if len(current) >= min_sequence_length:
+            result.append(list(current))
+
+    for img in sequence:
+        fb = img.focus_bracketing
+        count_cap = img.focus_bracket_image_count
+
+        # Boundary: FB state changed from the previous frame.
+        if current and fb != current_fb:
+            flush()
+            current.clear()
+            current_fb = None
+            current_count_cap = None
+
+        # Boundary: we hit the bracket's frame count and the next frame is
+        # part of a new bracket sequence.
+        if (fb is True
+                and current_count_cap is not None
+                and len(current) >= current_count_cap):
+            flush()
+            current.clear()
+            current_count_cap = None
+
+        if not current:
+            current_fb = fb
+            current_count_cap = count_cap if fb is True else None
+
+        current.append(img)
+
+    flush()
+    return result
+
+
 def generate_stack_name(images: List[ImageMetadata]) -> str:
     first_stem = Path(images[0].filepath).stem
     last_stem = Path(images[-1].filepath).stem
@@ -721,9 +883,23 @@ def has_varying_focus_distance(file_paths: List[str],
     if not distances:
         return None
 
-    # Check if all distances are the same within tolerance
     min_d = min(distances)
     max_d = max(distances)
+
+    # All frames at the same focus distance — constant focus. Catches both
+    # wind/wave/burst sequences (finite distance) and bursts at infinity.
+    # The legitimate-landscape-stack-at-infinity case is also caught here
+    # (false negative): EXIF "infinity" is reported once focus crosses a
+    # threshold, so a focus pull across the far range looks identical to a
+    # static burst at infinity. The all-inf case can't be disambiguated
+    # from EXIF alone (DNG conversion strips Canon MakerNotes that might
+    # have drive-mode/bracketing info). In practice all-inf bursts vastly
+    # outnumber all-inf focus stacks; rejecting catches the common case.
+    if min_d == max_d:
+        return False
+
+    # Spread within tolerance (e.g. tiny numerical drift on the same focus
+    # position) → still constant.
     if (max_d - min_d) <= tolerance:
         return False
 
@@ -1033,15 +1209,10 @@ def detect_stacks(directory: Path,
                 metadata_list.append(image_metadata)
                 metadata_by_path[fp] = image_metadata
 
-            # Extract focus distance from the same data
-            dist = entry.get("ApproximateFocusDistance")
-            if dist is not None:
-                try:
-                    focus_distances[fp] = float(dist)
-                except (ValueError, TypeError):
-                    focus_distances[fp] = None
-            else:
-                focus_distances[fp] = None
+            # Extract focus distance from the same data. Tries
+            # ApproximateFocusDistance (Nikon/Sony) then Canon MakerNotes
+            # FocusDistanceLower/Upper.
+            focus_distances[fp] = extract_focus_distance(entry)
 
         # Filter to manual mode if specified.
         # Match "Manual" (exiftool ExposureMode) and "Manual exposure" (LR
@@ -1064,7 +1235,15 @@ def detect_stacks(directory: Path,
 
         for signature, images in setting_groups.items():
             sequences = find_temporal_sequences(images, max_gap_seconds, min_sequence_length)
-            for sequence in sequences:
+            # Each temporal grouping can contain back-to-back focus brackets
+            # or a mix of bracketed + non-bracketed frames; subdivide by the
+            # camera's recorded FocusBracketing state when it's available.
+            sub_sequences = []
+            for seq in sequences:
+                sub_sequences.extend(
+                    split_sequence_by_focus_bracketing(seq, min_sequence_length)
+                )
+            for sequence in sub_sequences:
                 name = generate_stack_name(sequence)
                 first_img = sequence[0]
                 last_img = sequence[-1]
@@ -1093,10 +1272,12 @@ def detect_stacks(directory: Path,
                 for img in sequence:
                     candidate_stack_files.add(img.filepath)
 
-    # Targeted focus-distance pass: when the bulk metadata came from a non-exiftool
-    # source (e.g. Lightroom catalog), ApproximateFocusDistance is not available.
-    # Fetch it via exiftool but only for files in candidate stacks — typically tens
-    # of files instead of thousands.
+    # Targeted focus-distance pass: when the bulk metadata came from a non-
+    # exiftool source (e.g. Lightroom catalog), focus distance tags are not
+    # in the catalog. Fetch them via exiftool but only for files in candidate
+    # stacks — typically tens of files instead of thousands. Requests all
+    # supported focus-distance tags so we cover Nikon/Sony (XMP-aux) and
+    # Canon (MakerNotes) in one pass.
     if (validate_focus_distance
             and not skip_focus_distance_check
             and candidate_stack_files
@@ -1106,15 +1287,12 @@ def detect_stacks(directory: Path,
                 sorted(candidate_stack_files),
                 exiftool_path=exiftool_path,
                 timer=timer,
-                tags=["-ApproximateFocusDistance"],
+                tags=list(FOCUS_DISTANCE_TAGS),
             )
             for fp, entry in focus_entries.items():
-                dist = entry.get("ApproximateFocusDistance")
-                if dist is not None:
-                    try:
-                        focus_distances[fp] = float(dist)
-                    except (ValueError, TypeError):
-                        focus_distances[fp] = None
+                d = extract_focus_distance(entry)
+                if d is not None:
+                    focus_distances[fp] = d
 
     with timer.track("merge_and_validate"):
         # Merge adjacent stacks that form a continuous focus distance progression.
@@ -1141,6 +1319,22 @@ def detect_stacks(directory: Path,
             stack_files = candidate_stack_files
         else:
             for stack in candidate_stacks:
+                fb_states = [
+                    metadata_by_path[fp].focus_bracketing
+                    for fp in stack.files
+                    if fp in metadata_by_path
+                ]
+                # FocusBracketing=On (when present on all frames) is an
+                # authoritative camera-recorded signal that this IS a focus
+                # bracket — accept regardless of focus distance, since the
+                # lens's reported distance may collapse to "infinity" or stay
+                # constant for far-focus brackets.
+                if fb_states and all(s is True for s in fb_states):
+                    all_stacks.append(stack)
+                    for fp in stack.files:
+                        stack_files.add(fp)
+                    continue
+
                 if not focus_distances:
                     # No focus distance data at all — keep all candidates
                     all_stacks.append(stack)
@@ -1150,7 +1344,38 @@ def detect_stacks(directory: Path,
 
                 varies = has_varying_focus_distance(stack.files, focus_distances)
                 if varies is False:
-                    # All frames have the same focus distance — not a focus stack
+                    # Constant focus distance. Either a wind/wave/burst at a
+                    # known finite distance, or a sequence at infinity that
+                    # might be a legitimate focus bracket whose lens reports
+                    # "infinity" for every frame (Adobe collapses the range
+                    # to a sentinel during DNG conversion).
+                    #
+                    # When we have ANY FocusBracketing signal (CR3 with
+                    # MakerNotes intact), trust the camera: the FB=On branch
+                    # above already handled the positive case, so reaching
+                    # here means the camera said FB=Off (or mixed) — reject.
+                    #
+                    # When we have NO FocusBracketing signal at all (DNG
+                    # post-conversion stripped MakerNotes), err on the side
+                    # of keeping all-infinity sequences. Constant focus at
+                    # a FINITE distance is still a strong wind/wave signal
+                    # so we keep rejecting that.
+                    has_any_fb_signal = any(s is not None for s in fb_states)
+                    if not has_any_fb_signal:
+                        distances = [
+                            focus_distances.get(fp) for fp in stack.files
+                            if focus_distances.get(fp) is not None
+                        ]
+                        if distances and all(d == float("inf") for d in distances):
+                            # All-infinity without bracketing info — keep
+                            # (caller can manually delete if it's a sky
+                            # burst; the inverse case of silently dropping
+                            # a real focus bracket is harder to recover).
+                            all_stacks.append(stack)
+                            for fp in stack.files:
+                                stack_files.add(fp)
+                            continue
+
                     rejected_stacks.append(stack)
                     print(f"Rejected {stack.name}: constant focus distance "
                           f"(likely wind-timing shots, not a focus stack)",

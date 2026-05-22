@@ -171,6 +171,14 @@ Auto-detection currently scans these raw formats:
 
 The plugin has been used primarily with DNG source files, but detection is not limited to DNG.
 
+### Canon shooters: prefer native CR3 over DNG conversion
+
+If you're shooting a Canon body that supports in-camera focus bracketing (R5, R5 II, R6, R7, etc.), **import your files as native CR3 rather than converting them to DNG on import**. The CR3 MakerNotes section includes a `FocusBracketing` flag, `FocusBracketingImageCount`, sub-second timestamps, and other tags the plugin uses to distinguish a real focus bracket from a wind/wave/handheld burst with the same exposure settings.
+
+Adobe's CR3→DNG conversion strips MakerNotes, which removes those signals. The plugin still works on DNGs — it falls back to `ApproximateFocusDistance` and errs on the side of keeping ambiguous candidates so it doesn't silently drop legitimate stacks — but you'll get noticeably cleaner detection (fewer false positives, fewer false negatives) when Canon raws stay in CR3.
+
+This trade-off is Canon-specific. Nikon, Sony, and Fujifilm write the relevant focus-distance metadata in tags that survive DNG conversion, so converting their raws to DNG on import doesn't degrade detection.
+
 ### Why is the output always DNG?
 
 The plugin accepts raw source files as input and standardizes on a raw output file. In practice, that means DNG.

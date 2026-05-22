@@ -20,7 +20,7 @@ Several parts of the implementation are driven by external limitations rather th
 
 ## How Detection Works
 
-The detection algorithm identifies focus stacks through six steps applied in sequence:
+The detection algorithm identifies focus stacks through these steps:
 
 1. **Exposure mode filter** — only considers Manual mode by default (configurable). This avoids false positives from aperture-priority burst shooting (e.g., birds/wildlife).
 
@@ -28,15 +28,34 @@ The detection algorithm identifies focus stacks through six steps applied in seq
 
 3. **Temporal proximity** — within each settings group, finds sequences where the gap between end of one exposure and start of the next is within an allowed threshold. The threshold scales with exposure time to handle long exposures — cameras need more buffer time to write a 10-second exposure (~1.07s gap) than a 1/250s exposure (~0.3s gap). Formula: `effective_gap = max_gap + (exposure_time * gap_exposure_scale)`.
 
-4. **Minimum sequence length** — requires at least 4 frames (configurable). Sequences shorter than this are not considered stacks.
+4. **FocusBracketing-based splitting** — when the camera recorded a `FocusBracketing` tag (Canon writes this in CR3 MakerNotes), a temporal sequence is subdivided wherever consecutive frames have different `FocusBracketing` states, or wherever a run of `FocusBracketing=On` frames reaches `FocusBracketingImageCount`. This cleanly separates back-to-back focus brackets captured within the same temporal grouping. When no frame carries the tag (e.g., DNGs where Adobe's CR3→DNG conversion stripped MakerNotes), this step is a no-op.
 
-5. **Adjacent stack merging** — after initial detection, checks if consecutive stacks (same settings, close in time) have continuous focus distance progression. The merge window is intentionally tight: stack B must begin within a small multiple of stack A's last exposure time, and the focus distance gap between stacks must be small relative to the total combined range. This catches genuine extended sweeps while avoiding false positives from separate stacks shot later in the sequence.
+5. **Minimum sequence length** — requires at least 4 frames (configurable). Sequences shorter than this are not considered stacks.
 
-6. **Focus distance validation** — uses `exiftool` to read `ApproximateFocusDistance` from XMP metadata. If all frames in a candidate sequence have the same focus distance, it's rejected as a false positive (e.g., wind-timing shots where you're re-shooting the same composition waiting for wind to stop). If focus distance varies across frames, it's confirmed as a real focus stack. If focus distance data is unavailable, the candidate is kept (fail-open).
+6. **Adjacent stack merging** — after initial detection, checks if consecutive stacks (same settings, close in time) have continuous focus distance progression. The merge window is intentionally tight: stack B must begin within a small multiple of stack A's last exposure time, and the focus distance gap between stacks must be small relative to the total combined range. This catches genuine extended sweeps while avoiding false positives from separate stacks shot later in the sequence.
 
-All five heuristics run in a single `exiftool -json` batch call per directory — no per-file overhead.
+7. **Focus distance validation** — uses focus-distance metadata to reject sequences whose focus didn't actually move (wind/wave/burst false positives). Values are read in preference order: `ApproximateFocusDistance` (XMP-aux, Nikon/Sony) → `FocusDistanceLower` (Canon MakerNotes near-DOF limit) → `FocusDistanceUpper` (Canon far-DOF limit). The decision depends on what other signals are available:
 
-Detection also makes a best-effort attempt to correlate pre-existing merged result files back to the detected source stack. Exact filename matches are preferred, and a conservative heuristic fallback can match renamed DNG/TIFF/PSD results by exposure fingerprint and capture timestamp. This only works when the result file lives in the same physical folder as the source files being scanned.
+   - **`FocusBracketing=On` for all frames** → accept regardless of focus distance. The camera explicitly recorded that the photographer was bracketing focus; the lens may report a constant value (especially at infinity) but the bracket is real.
+   - **Constant focus distance, FB signal present (= `Off` or mixed)** → reject. The camera said no bracketing.
+   - **Constant focus distance at a finite value, no FB signal** → reject. Strong wind/wave/burst signal at a known subject distance.
+   - **Constant focus distance at infinity, no FB signal** → keep. EXIF "infinity" collapses both legitimate far-focus brackets and constant-focus sky bursts into the same value; without the FB tag we err on keeping (a false-positive collection is easy to delete; a silently-dropped real stack is hard to recover).
+   - **Focus distance varies across frames** → accept (real focus pull).
+   - **Focus distance missing for more than half the frames** → accept (insufficient data, fail-open).
+
+### Metadata sources
+
+By default the plugin reads camera metadata from the Lightroom catalog (`photo:getRawMetadata`) — it's already in memory, so scanning is fast and doesn't touch the source files on disk. The catalog provides timestamps and camera settings but **not** focus-distance or FocusBracketing tags; those live in EXIF/XMP/MakerNotes.
+
+When the catalog source is in use and focus-distance validation is enabled, a small targeted `exiftool` call is issued **only for the files in candidate stacks** to read the focus tags. This keeps the heavy disk read scoped to the small set of files we actually need to validate, instead of reading every raw in the directory.
+
+An alternative ExifTool metadata provider is also available (configurable in the plugin settings) — slower because it reads every source file from disk, but useful when the catalog metadata is stale.
+
+### Raw-format note: DNG vs. native CR3 (Canon)
+
+For Canon bodies, **keeping CR3 files native (not converting to DNG on import)** gives substantially better detection accuracy. The CR3 MakerNotes section contains `FocusBracketing` (On/Off), `FocusBracketingImageCount`, sub-second timestamps, and other fields that authoritatively distinguish a focus bracket from a wind/wave burst at the same camera settings. **Adobe's CR3→DNG conversion strips MakerNotes**, leaving the plugin to fall back on `ApproximateFocusDistance` alone — which collapses to a sentinel "infinity" value for any focus position past the lens's measurable range, so legitimate infinity-focused focus brackets become indistinguishable from sky/cloud bursts. The plugin handles this by erring on the side of keeping all-infinity candidates when no FB signal is present (see step 7), but you'll get cleaner results out of the box if Canon raws come in as CR3. Nikon, Sony, and Fujifilm raws write focus-distance metadata in tags that survive DNG conversion, so the trade-off is Canon-specific.
+
+Detection also makes a best-effort attempt to correlate pre-existing merged result files back to the detected source stack. Exact filename matches are preferred (covers both the plugin's own `_stacked.<ext>` outputs and Helicon Focus's `<name> (N files).<ext>` and legacy `<name>-<count>(method,Rradius,Ssmoothing).<ext>` naming, including Lightroom `-Edit` derivatives), and a conservative heuristic fallback can correlate renamed DNG/TIFF/PSD results by exposure fingerprint and capture timestamp. This only works when the result file lives in the same physical folder as the source files being scanned.
 
 ## Plugin Architecture
 

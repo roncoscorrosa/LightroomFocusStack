@@ -14,6 +14,8 @@ local FsmExifToolMeta = {}
 
 -- Tags read by the detection algorithm. Mirrors EXIFTOOL_DEFAULT_TAGS in
 -- detect_stacks.py - keep in sync if either side adds a tag.
+-- ApproximateFocusDistance is XMP-aux (Nikon/Sony). FocusDistanceUpper/Lower
+-- live in Canon MakerNotes; they only appear with -fast (not -fast2).
 local DEFAULT_TAGS = {
     "-DateTimeOriginal",
     "-CreateDate",
@@ -24,6 +26,11 @@ local DEFAULT_TAGS = {
     "-ExposureTime",
     "-ExposureMode",
     "-ApproximateFocusDistance",
+    "-FocusDistanceUpper",
+    "-FocusDistanceLower",
+    -- Canon focus-bracket MakerNotes (CR3 only; stripped by DNG conversion).
+    "-FocusBracketing",
+    "-FocusBracketingImageCount",
     "-PreviewApplicationName",
     "-Software",
     "-CreatorTool",
@@ -88,7 +95,10 @@ function FsmExifToolMeta.getMetadataForFiles(exiftoolPath, filePaths)
     local stdoutPath = nextTmpPath("json")
     local stderrPath = nextTmpPath("stderr")
 
-    local cmd = shellEscape(exiftool) .. " -fast2 -json"
+    -- -fast (not -fast2): we need MakerNotes for Canon's FocusDistanceUpper/
+    -- Lower, which -fast2 strips. Cost is small on cold cache (~5%) and only
+    -- affects exiftool-mode runs; the catalog provider path is unchanged.
+    local cmd = shellEscape(exiftool) .. " -fast -json"
     for _, tag in ipairs(DEFAULT_TAGS) do
         cmd = cmd .. " " .. tag
     end

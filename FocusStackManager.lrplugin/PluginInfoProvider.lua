@@ -23,7 +23,7 @@ local function sectionsForTopOfDialog(f, properties)
     if prefs.result_keyword == nil then prefs.result_keyword = "" end
     if prefs.source_keyword == nil then prefs.source_keyword = "" end
     if prefs.metadata_provider == nil then prefs.metadata_provider = "lr_catalog" end
-    if prefs.validate_focus_distance == nil then prefs.validate_focus_distance = false end
+    if prefs.validate_focus_distance == nil then prefs.validate_focus_distance = true end
 
     return {
         {
@@ -172,10 +172,12 @@ local function sectionsForTopOfDialog(f, properties)
                 },
                 f:checkbox {
                     value = bind { key = 'validate_focus_distance', object = prefs },
-                    title = "Validate focus distance (requires exiftool, slower)",
-                    tooltip = "When enabled, exiftool reads ApproximateFocusDistance for each candidate stack " ..
-                        "and rejects sequences where the focus distance never changes — these are typically " ..
-                        "wind-timing or burst shots, not real focus stacks. Adds a small per-stack disk read.",
+                    title = "Validate focus distance (recommended)",
+                    tooltip = "Rejects candidate sequences whose focus distance never changes across frames. " ..
+                        "These are typically wind-timing bursts or wave-motion bursts shot at constant " ..
+                        "settings, not real focus stacks. Uses exiftool to read focus-distance metadata that " ..
+                        "isn't stored in the Lightroom catalog (ApproximateFocusDistance on Nikon/Sony; " ..
+                        "FocusDistanceLower/Upper on Canon). Adds a small exiftool read per candidate stack.",
                 },
             },
 
