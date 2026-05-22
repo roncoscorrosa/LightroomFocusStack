@@ -1272,27 +1272,34 @@ def detect_stacks(directory: Path,
                 for img in sequence:
                     candidate_stack_files.add(img.filepath)
 
-    # Targeted focus-distance pass: when the bulk metadata came from a non-
-    # exiftool source (e.g. Lightroom catalog), focus distance tags are not
-    # in the catalog. Fetch them via exiftool but only for files in candidate
-    # stacks — typically tens of files instead of thousands. Requests all
-    # supported focus-distance tags so we cover Nikon/Sony (XMP-aux) and
-    # Canon (MakerNotes) in one pass.
+    # Targeted focus-distance pass: when the bulk metadata didn't already
+    # include focus distance for candidate stack files (e.g. Lightroom
+    # catalog source doesn't carry the tags), fetch them via exiftool but
+    # only for the files in candidate stacks AND only the ones missing data
+    # — typically tens of files instead of thousands. Requests all supported
+    # focus-distance tags so we cover Nikon/Sony (XMP-aux) and Canon
+    # (MakerNotes) in one pass. Skips entirely when the bulk metadata
+    # already supplied focus distances (e.g. the ExifTool metadata source
+    # passed them in), avoiding a redundant second exiftool invocation.
     if (validate_focus_distance
             and not skip_focus_distance_check
-            and candidate_stack_files
-            and metadata is not None):
-        with timer.track("focus_distance_validation_fetch"):
-            focus_entries = batch_extract_metadata(
-                sorted(candidate_stack_files),
-                exiftool_path=exiftool_path,
-                timer=timer,
-                tags=list(FOCUS_DISTANCE_TAGS),
-            )
-            for fp, entry in focus_entries.items():
-                d = extract_focus_distance(entry)
-                if d is not None:
-                    focus_distances[fp] = d
+            and candidate_stack_files):
+        files_missing_focus = sorted(
+            fp for fp in candidate_stack_files
+            if focus_distances.get(fp) is None
+        )
+        if files_missing_focus:
+            with timer.track("focus_distance_validation_fetch"):
+                focus_entries = batch_extract_metadata(
+                    files_missing_focus,
+                    exiftool_path=exiftool_path,
+                    timer=timer,
+                    tags=list(FOCUS_DISTANCE_TAGS),
+                )
+                for fp, entry in focus_entries.items():
+                    d = extract_focus_distance(entry)
+                    if d is not None:
+                        focus_distances[fp] = d
 
     with timer.track("merge_and_validate"):
         # Merge adjacent stacks that form a continuous focus distance progression.

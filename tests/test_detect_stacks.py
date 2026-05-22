@@ -1916,6 +1916,74 @@ class TestDetectStacksExternalMetadata(TestCase):
         self.assertEqual(len(result["stacks"]), 1)
 
     @patch('detect_stacks.batch_extract_metadata')
+    def test_targeted_pass_skipped_when_metadata_already_has_focus_distance(self, mock_batch):
+        """When the bulk metadata (e.g. from the ExifTool provider) already
+        included focus distance for every candidate file, the targeted
+        second-pass exiftool call must not fire — that would be redundant."""
+        base = datetime(2026, 1, 15, 8, 30, 0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = make_stack_sequence(1000, 6, base_time=base, interval_seconds=0.3, directory=tmpdir)
+            for img in images:
+                Path(img.filepath).touch()
+
+            # External metadata that DOES include focus distance for every
+            # frame (simulates the ExifTool provider passing focus tags
+            # along with the basic camera settings).
+            external = {}
+            for i, img in enumerate(images):
+                entry = metadata_to_exiftool_entry(img, focus_distance=1.0 + 0.5 * i)
+                external[img.filepath] = entry
+
+            result = detect_stacks(
+                Path(tmpdir),
+                metadata=external,
+                validate_focus_distance=True,
+            )
+
+        # Targeted call never fired — focus distance was already populated.
+        mock_batch.assert_not_called()
+        self.assertEqual(len(result["stacks"]), 1)
+        self.assertEqual(result["stacks"][0]["count"], 6)
+
+    @patch('detect_stacks.batch_extract_metadata')
+    def test_targeted_pass_only_fetches_missing_files(self, mock_batch):
+        """Hybrid case: bulk metadata had focus distance for some files but
+        not others. The targeted call should only fetch the missing ones."""
+        base = datetime(2026, 1, 15, 8, 30, 0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = make_stack_sequence(1000, 6, base_time=base, interval_seconds=0.3, directory=tmpdir)
+            for img in images:
+                Path(img.filepath).touch()
+
+            # First 3 files have focus distance; last 3 don't.
+            external = {}
+            for i, img in enumerate(images):
+                if i < 3:
+                    external[img.filepath] = metadata_to_exiftool_entry(img, focus_distance=2.0 + i)
+                else:
+                    external[img.filepath] = metadata_to_exiftool_entry(img)
+
+            mock_batch.return_value = {
+                images[i].filepath: {
+                    "SourceFile": images[i].filepath,
+                    "ApproximateFocusDistance": 5.0 + (i - 3),
+                } for i in range(3, 6)
+            }
+
+            result = detect_stacks(
+                Path(tmpdir),
+                metadata=external,
+                validate_focus_distance=True,
+            )
+
+        # Targeted call fired exactly once, and only for the 3 missing files.
+        self.assertEqual(mock_batch.call_count, 1)
+        passed_paths = mock_batch.call_args.args[0]
+        self.assertEqual(len(passed_paths), 3)
+        self.assertEqual(passed_paths, sorted(img.filepath for img in images[3:]))
+        self.assertEqual(len(result["stacks"]), 1)
+
+    @patch('detect_stacks.batch_extract_metadata')
     def test_no_focus_distance_pass_without_flag(self, mock_batch):
         """validate_focus_distance=False (default) skips the targeted call entirely."""
         base = datetime(2026, 1, 15, 8, 30, 0)
