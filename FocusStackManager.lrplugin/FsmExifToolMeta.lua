@@ -79,6 +79,40 @@ local function nextTmpPath(suffix)
     return LrPathUtils.child(tempDir, name)
 end
 
+local MAX_REPORTED_ERRORS = 5
+
+-- exiftool exits 1 if any single file errors (e.g. "Error: File is empty -
+-- foo.CR3"), so surface the per-file errors instead of a bare exit code.
+-- LrTasks.execute returns the raw wait status, so 256 means exit code 1.
+local function describeFailure(exitCode, stderr)
+    local errors = {}
+    for line in string.gmatch(stderr, "[^\r\n]+") do
+        if string.find(line, "^Error:") then
+            -- Files usually share a folder; the leaf name is enough to find them.
+            errors[#errors + 1] = (string.gsub(line, " %- .*/", " - "))
+        end
+    end
+
+    local msg = string.format("exiftool failed (exit status %d)", exitCode)
+    if #errors == 0 then
+        local firstLine = string.match(stderr, "[^\r\n]+")
+        if firstLine then
+            msg = msg .. ":\n" .. firstLine
+        end
+        return msg
+    end
+
+    msg = msg .. string.format(" with %d file error(s):", #errors)
+    for i = 1, math.min(#errors, MAX_REPORTED_ERRORS) do
+        msg = msg .. "\n" .. errors[i]
+    end
+    if #errors > MAX_REPORTED_ERRORS then
+        msg = msg .. string.format("\n...and %d more (full list in plugin log)",
+            #errors - MAX_REPORTED_ERRORS)
+    end
+    return msg
+end
+
 -- Returns metadata, photosByPath. ExifTool has no catalog access, so the
 -- second return is always an empty table; callers that need photo objects
 -- will fall back to catalog:findPhotoByPath.
@@ -114,7 +148,7 @@ function FsmExifToolMeta.getMetadataForFiles(exiftoolPath, filePaths)
     if exitCode ~= 0 then
         logger:info("exiftool metadata extract failed (exit " .. tostring(exitCode) ..
             "). stderr:\n" .. stderr)
-        error(string.format("exiftool failed (exit %d)", exitCode))
+        error(describeFailure(exitCode, stderr), 0)
     end
 
     if stdout == "" then
